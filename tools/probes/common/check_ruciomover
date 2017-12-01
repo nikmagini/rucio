@@ -1,0 +1,226 @@
+#!/usr/bin/env python
+# Copyright European Organization for Nuclear Research (CERN) 2017
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# You may not use this file except in compliance with the License.
+# You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
+#
+# Authors:
+# - Nicolo Magini, <Nicolo.Magini@cern.ch>, 2017
+
+'''
+Probe to check read/write with all protocols on target RSE with rucio client
+'''
+
+import os
+import sys
+import re
+import tempfile
+import time
+import uuid
+from commands import getstatusoutput
+import filecmp
+
+import argparse
+
+from rucio.common.config import config_get
+from rucio.common.exception import RSEProtocolNotSupported, RSENotFound
+from rucio.rse import rsemanager
+
+def upload(rse, protocol, scope, lfn, no_register=False):
+        """
+        Use the rucio upload command to stage out the file.
+        :param rse - destination RSE
+        :param protocol - transfer protocol
+        :param scope - file scope      
+        :param lfn - file lfn
+	:param no_register - skip file registration in Rucio; also disables auto-deletion at lifetime expiration
+        """
+
+	if no_register:
+		no_reg_option='--no-register'
+	else:
+		no_reg_option='--lifetime 3600'
+
+        cmd = 'rucio upload %s --rse %s --protocol %s --scope %s %s' % (no_reg_option, rse, protocol, scope, lfn)
+
+        print 'stageOutCmd: %s' % cmd
+        s, o = getstatusoutput(cmd)
+        print 'stageOutOutput: %s' % o
+        
+        if s:
+            raise Exception('stageOut failed -- rucio upload did not succeed: %s' % o.replace('\n', ''))
+
+
+def download(rse, protocol, scope, lfn, dst, pfn=None):
+        """
+        Use the rucio download command to stage in the file.
+        :param rse:   source RSE
+        :param protocol: transfer protocol
+        :param scope: file scope
+        :param lfn:   file lfn
+        :param dst:   local destination directory
+	:param pfn:   file pfn (required when the downloaded file is not registered in Rucio
+        """
+	pfnOption=''
+	if pfn:
+		pfnOption='--pfn %s' % pfn
+
+        cmd = 'rucio download --dir %s --rse %s --protocol %s %s %s:%s' % (dst,
+                                                                         rse,
+                                                                         protocol,
+									 pfnOption,
+                                                                         scope,
+                                                                         lfn)
+        print 'stageInCmd: %s' % cmd
+        s, o = getstatusoutput(cmd)
+        
+        print 'stageInOutput: %s' % o
+
+        if s:
+            raise Exception('stageIn failed -- rucio download did not succeed: %s' % o.replace('\n', ''))
+
+
+OK, WARNING, CRITICAL, UNKNOWN = 0, 1, 2, 3
+
+parser=argparse.ArgumentParser()
+parser.add_argument('RSE', help='Target RSE to test')
+parser.add_argument('--no-register', '-n', action='store_true', help='Switch off registration of the uploaded file in Rucio, disabling auto-deletion')
+parser.add_argument('--color', '-c', action='store_true', help='Enable color in rucio client output')
+group = parser.add_mutually_exclusive_group()
+group.add_argument('--download', '-d', metavar='DID', action='store', default='user.mlassnig:user.mlassnig.pilot.test.single.hits', help='Specify a fixed container DID containing one file for the download test')
+group.add_argument('--download-uploaded', '-du', action='store_true', help='Use the file uploaded in the upload test also in the download test')
+parser.add_argument('--testmode', '-t', action='store_true', help='Run probe in standalone test mode outside nagios env')
+
+try:
+	args=parser.parse_args()
+except SystemExit:
+	sys.exit(UNKNOWN)
+
+if len(args.download.split(':'))!=2:
+	print "Wrong format for DID %s - required format is scope:name" % args.download
+	sys.exit(UNKNOWN)
+
+if not args.color:
+	# Disable rucio client colors
+	os.environ['RUCIO_LOGGING_FORMAT'] = '%(asctime)s %(levelname)s [%(message)s]'
+
+rse=args.RSE
+if not re.match('^[A-Za-z0-9_-]+$', rse):
+	print 'Invalid RSE name %s' % rse
+	sys.exit(UNKNOWN)
+
+print rse
+
+scope='tests'
+
+timestamp='%d' % time.time()
+fileuuid=str(uuid.uuid1())
+
+reportfile='%s/nagios-check_ruciomover.%s.%s.csv' % (os.getcwd(), rse, timestamp)
+
+workdir=tempfile.mkdtemp(prefix = '%s.%s.' % (rse, timestamp))
+os.chdir(workdir)
+print os.getcwd()
+
+if not args.testmode:
+	try:
+		proxy = config_get('nagios', 'proxy')
+		os.environ["X509_USER_PROXY"] = proxy
+	except Exception as e:
+		print "Failed to get proxy from rucio.cfg"
+		sys.exit(UNKNOWN)
+
+try:
+        rse_settings = rsemanager.get_rse_info(rse)
+
+	rse_protocols=rse_settings['protocols']
+
+	report={}
+
+        for prot in rse_protocols:
+
+	    # Run tests only if the RSE supports read/write for this protocol.
+	    # Need to check for wan since the nagios probe is running remotely. 	
+            if not (prot['domains']['wan']['read'] and prot['domains']['wan']['write']):
+                continue
+
+	    report[prot['scheme']]={'upload':'UNKNOWN', 'download':'UNKNOWN'}
+
+            filename='%s.nagios-check_ruciomover.%s.%s.%s.%s' % (scope, rse, prot['scheme'], timestamp, fileuuid)
+	    print filename
+	    
+	    with open(filename, 'w') as f:
+                f.write('test file for %s with %s at time %s\n' % (rse, prot['scheme'], timestamp))
+                f.close()
+		
+	    pfn=rsemanager.lfns2pfns(rse_settings, {'scope':scope, 'name':filename}, scheme=prot['scheme'])['%s:%s' % (scope, filename)]
+	    print pfn
+
+	    try:
+		    upload(rse, prot['scheme'], scope, filename, no_register=args.no_register)
+		    report[prot['scheme']]['upload']='OK'
+	    except Exception, e:
+		    print e
+		    report[prot['scheme']]['upload']='CRITICAL'
+		    if args.download_uploaded:
+			    os.unlink(filename)
+			    continue
+	    
+            dst='download/%s.%s.%s' % (rse, prot['scheme'], timestamp)
+	  
+	    pfntodownload=None
+
+	    if args.download_uploaded:
+		    downloadscope=scope
+		    didtodownload=filename
+		    destination='%s/%s/%s' % (dst, downloadscope, didtodownload)
+		    # The PFN needs to be specified explicitly when downloading an unregisterd file
+		    if args.no_register:
+			    pfntodownload=pfn
+	    else:
+		    downloadscope=args.download.split(':')[0]
+		    didtodownload=args.download.split(':')[1]
+		    destination='%s/%s' % (dst, didtodownload)
+
+
+	    try:
+		    download(rse, prot['scheme'], downloadscope, didtodownload, dst, pfn=pfntodownload)
+		    report[prot['scheme']]['download']='OK'
+	    except Exception, e:
+		    print e
+		    report[prot['scheme']]['download']='CRITICAL'
+	    
+	    if args.download_uploaded:
+		    if not filecmp.cmp(filename, destination):
+			    print 'WARNING - Uploaded %s and downloaded %s files differ' % (filename, destination)
+			    report[prot['scheme']]['download']='WARNING'
+		    else:
+			    print 'Test successful: uploaded %s and downloaded %s files match' % (filename, destination)
+
+
+	    os.unlink(filename)
+	    if os.path.isfile(destination):
+		    os.unlink(destination)
+		    os.removedirs(os.path.dirname(destination))
+	    elif os.path.isdir(destination):
+		    for fil in os.listdir(destination):
+			    os.unlink('%s/%s' % (destination, fil))
+		    os.removedirs(destination)
+
+	os.rmdir(workdir)
+
+	with open(reportfile, 'w') as fil:
+		for proto in report:
+			for op in report[proto]:
+				fil.write('%s,%s,%s,%s,%s\n' % (rse, op, proto, report[proto][op], timestamp))
+		fil.close()
+	    
+except RSEProtocolNotSupported, e:
+        print e
+        sys.exit(CRITICAL)
+except RSENotFound, e:
+        print e
+	sys.exit(UNKNOWN)
+
+sys.exit(OK)
