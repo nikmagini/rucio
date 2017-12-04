@@ -27,6 +27,7 @@ from rucio.common.config import config_get
 from rucio.common.exception import RSEProtocolNotSupported, RSENotFound
 from rucio.rse import rsemanager
 from rucio.client.rseclient import RSEClient
+from rucio.client.replicaclient import ReplicaClient
 
 def upload(rse, protocol, scope, lfn, no_register=False):
         """
@@ -145,6 +146,14 @@ try:
 	
 	rse_protocols=rse_settings['protocols']
 
+	# Check if the DID selected for the download test is present on the target RSE
+	skip_download=False
+	if not args.download_uploaded:
+		repcli = ReplicaClient()
+		reps = [r for r in repcli.list_replicas([{'scope': args.download.split(':')[0], 'name': args.download.split(':')[1]}])]
+		if len(reps)==0 or rse not in reps[0]['rses'].keys():
+			skip_download=True
+
 	report={}
 
         for prot in rse_protocols:
@@ -197,6 +206,10 @@ try:
 		    if args.no_register:
 			    pfntodownload=pfn
 	    else:
+		    if skip_download:
+			    print "Skipping download test because selected DID %s was not found on RSE %s\n" % (args.download, rse)
+			    os.unlink(filename)
+			    continue
 		    downloadscope=args.download.split(':')[0]
 		    didtodownload=args.download.split(':')[1]
 		    destination='%s/%s' % (dst, didtodownload)
@@ -211,10 +224,10 @@ try:
 	    
 	    if args.download_uploaded:
 		    if not filecmp.cmp(filename, destination):
-			    print 'WARNING - Uploaded %s and downloaded %s files differ' % (filename, destination)
+			    print 'WARNING - Uploaded %s and downloaded %s files differ\n' % (filename, destination)
 			    report[prot['scheme']]['download']='WARNING'
 		    else:
-			    print 'Test successful: uploaded %s and downloaded %s files match' % (filename, destination)
+			    print 'Test successful: uploaded %s and downloaded %s files match\n' % (filename, destination)
 
 
 	    os.unlink(filename)
@@ -228,7 +241,7 @@ try:
 
 	os.rmdir(workdir)
 
-	print 'writing report file to:\n%s\n'
+	print 'Writing report file to:\n%s\n' % reportfile
 	with open(reportfile, 'w') as fil:
 		for proto in report:
 			for op in report[proto]:
