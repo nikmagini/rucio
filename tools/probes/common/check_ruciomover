@@ -45,9 +45,9 @@ def upload(rse, protocol, scope, lfn, no_register=False):
 
         cmd = 'rucio upload %s --rse %s --protocol %s --scope %s %s' % (no_reg_option, rse, protocol, scope, lfn)
 
-        print 'stageOutCmd: %s' % cmd
+        print 'Will use the following command for stageOut:\n%s\n' % cmd
         s, o = getstatusoutput(cmd)
-        print 'stageOutOutput: %s' % o
+        print 'stageOut output:\n%s\n' % o
         
         if s:
             raise Exception('stageOut failed -- rucio upload did not succeed: %s' % o.replace('\n', ''))
@@ -73,10 +73,10 @@ def download(rse, protocol, scope, lfn, dst, pfn=None):
 									 pfnOption,
                                                                          scope,
                                                                          lfn)
-        print 'stageInCmd: %s' % cmd
+        print 'Will use the following command for stageIn:\n%s\n' % cmd
         s, o = getstatusoutput(cmd)
         
-        print 'stageInOutput: %s' % o
+        print 'stageIn output:\n%s\n' % o
 
         if s:
             raise Exception('stageIn failed -- rucio download did not succeed: %s' % o.replace('\n', ''))
@@ -111,7 +111,7 @@ if not re.match('^[A-Za-z0-9_-]+$', rse):
 	print 'Invalid RSE name %s' % rse
 	sys.exit(UNKNOWN)
 
-print rse
+print 'Testing RSE:\n%s\n' % rse
 
 scope='tests'
 
@@ -122,7 +122,8 @@ reportfile='%s/nagios-check_ruciomover.%s.%s.csv' % (os.getcwd(), rse, timestamp
 
 workdir=tempfile.mkdtemp(prefix = '%s.%s.' % (rse, timestamp))
 os.chdir(workdir)
-print os.getcwd()
+
+print 'Running in working directory:\n%s\n' % os.getcwd()
 
 if not args.testmode:
 	try:
@@ -153,23 +154,32 @@ try:
             if not (prot['domains']['wan']['read'] and prot['domains']['wan']['write']):
                 continue
 
+	    print 'Testing protocol:\n%s\n' % prot['scheme']
+
 	    report[prot['scheme']]={'upload':'UNKNOWN', 'download':'UNKNOWN'}
 
             filename='%s.nagios-check_ruciomover.%s.%s.%s.%s' % (scope, rse, prot['scheme'], timestamp, fileuuid)
-	    print filename
+	    print 'Will use the following test file for upload:\n%s\n' % filename
 	    
 	    with open(filename, 'w') as f:
                 f.write('test file for %s with %s at time %s\n' % (rse, prot['scheme'], timestamp))
                 f.close()
-		
-	    pfn=rsemanager.lfns2pfns(rse_settings, {'scope':scope, 'name':filename}, scheme=prot['scheme'])['%s:%s' % (scope, filename)]
-	    print pfn
+
+	    if rse_settings['deterministic']:
+		    pfn=rsemanager.lfns2pfns(rse_settings, {'scope':scope, 'name':filename}, scheme=prot['scheme'])['%s:%s' % (scope, filename)]
+		    print 'Rucio will use the following deterministic PFN for upload:\n%s\n' % pfn
+	    else:
+		    print 'Cannot predetermine pfn on non-deterministic storage\n'
+		    if args.no_register:
+			    print 'Skipping test'
+			    os.unlink(filename)
+			    continue
 		
 	    try:
 		    upload(rse, prot['scheme'], scope, filename, no_register=args.no_register)
 		    report[prot['scheme']]['upload']='OK'
-	    except Exception, e:
-		    print e
+	    except Exception as e:
+		    print '\n%s\n' % e
 		    report[prot['scheme']]['upload']='CRITICAL'
 		    if args.download_uploaded:
 			    os.unlink(filename)
@@ -195,8 +205,8 @@ try:
 	    try:
 		    download(rse, prot['scheme'], downloadscope, didtodownload, dst, pfn=pfntodownload)
 		    report[prot['scheme']]['download']='OK'
-	    except Exception, e:
-		    print e
+	    except Exception as e:
+		    print '\n%s\n' % e
 		    report[prot['scheme']]['download']='CRITICAL'
 	    
 	    if args.download_uploaded:
@@ -218,16 +228,17 @@ try:
 
 	os.rmdir(workdir)
 
+	print 'writing report file to:\n%s\n'
 	with open(reportfile, 'w') as fil:
 		for proto in report:
 			for op in report[proto]:
 				fil.write('%s,%s,%s,%s,%s\n' % (rse, op, proto, report[proto][op], timestamp))
 		fil.close()
 	    
-except RSEProtocolNotSupported, e:
+except RSEProtocolNotSupported as e:
         print e
         sys.exit(CRITICAL)
-except RSENotFound, e:
+except RSENotFound as e:
         print e
 	sys.exit(UNKNOWN)
 
