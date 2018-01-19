@@ -907,18 +907,28 @@ def upload(args):
     else:
         fscope = 'user.' + client.account
 
+    forced_protocol = args.protocol
     if args.pfn and not args.no_register:
         logger.error('You must specify --no-register if you use the --pfn option. Aborting.')
         return FAILURE
     elif args.pfn:
         selected_pfn_protocol = args.pfn.split(':')[0]
         logger.debug('PFN option specified, extracting protocol from given PFN: %s' % selected_pfn_protocol)
+        if args.protocol and selected_pfn_protocol != args.protocol:
+            logger.error('Specified protocol %s is inconsistent with given PFN %s. Aborting.' % (args.protocol, args.pfn))
+            return FAILURE
+        rse_settings['hostname'] = ''
+        rse_settings['prefix'] = ''
+        forced_protocol = selected_pfn_protocol
+    if forced_protocol:
         try:
-            rse_settings['hostname'] = ''
-            rse_settings['prefix'] = ''
-            protocol = rsemgr.select_protocol(rse_settings, operation='read', scheme=selected_pfn_protocol)
+            logger.debug('Forcing protocol : %s' % forced_protocol)
+            logger.debug('Forcing RSE : %s' % args.rse)
+            protocol = rsemgr.select_protocol(rse_settings,
+                                              operation='write',
+                                              scheme=forced_protocol)
         except RSEProtocolNotSupported as error:
-            logger.error('The specified protocol (%s) is not supported by %s' % (args.protocol, args.rse))
+            logger.error('The specified protocol (%s) is not supported by %s' % (forced_protocol, args.rse))
             logger.debug(error)
             return FAILURE
 
@@ -974,19 +984,6 @@ def upload(args):
             logger.error("No operation will be performed. Exiting!")
             return FAILURE
 
-    if args.protocol:
-        try:
-            logger.debug('Forcing protocol : %s' % args.protocol)
-            logger.debug('Forcing RSE : %s' % args.rse)
-            protocol = rsemgr.select_protocol(rse_settings,
-                                              operation='read',
-                                              scheme=args.protocol)
-        except RSEProtocolNotSupported as error:
-            logger.error('The specified protocol (%s) is not supported by %s' % (args.protocol, args.rse))
-            logger.debug(error)
-            return FAILURE
-        rse_settings['protocols'] = [protocol, ]
-
     if args.account is None:
         account = client.whoami()['account']
     else:
@@ -1032,25 +1029,45 @@ def upload(args):
             else:
                 if meta['adler32'] == f['adler32']:
                     logger.info('Local files and file %s:%s recorded in Rucio have the same checksum. Will try the upload' % (f['scope'], f['name']))
-                    directory = revert_dict[f['scope'], f['name']]
-                    trace['remoteSite'] = rse_settings['rse']
-                    trace['protocol'] = rse_settings['protocols'][0]['scheme']
-                    trace['filesize'] = f['bytes']
-                    trace['transferStart'] = time.time()
-                    f['upstate'] = rsemgr.upload(rse_settings=rse_settings,
-                                                 lfns=[{'filename': f['filename'],
-                                                        'name': f['name'],
-                                                        'scope': f['scope'],
-                                                        'adler32': f['adler32'],
-                                                        'filesize': f['bytes']}],
-                                                 source_dir=directory,
-                                                 force_pfn=args.pfn)
-                    trace['transferEnd'] = time.time()
-                    trace['clientState'] = 'DONE'
-                    logger.info('File %s:%s successfully uploaded on the storage' % (f['scope'], f['name']))
-                    send_trace(trace, client.host, args.user_agent)
-                    summary.append(deepcopy(f))
-                    f.pop('upstate', None)
+                    success = False
+                    protocols = rsemgr.get_protocols_ordered(rse_settings, operation='write', scheme=forced_protocol)
+                    logger.debug('%d possible protocol(s) for write' % len(protocols))
+                    while not success and len(protocols):
+                        protocol = protocols.pop(0)
+                        logger.debug('Trying protocol %s at %s' % (protocol['scheme'], rse_settings['rse']))
+                        directory = revert_dict[f['scope'], f['name']]
+                        trace['remoteSite'] = rse_settings['rse']
+                        trace['protocol'] = protocol['scheme']
+                        trace['filesize'] = f['bytes']
+                        try:
+                            trace['transferStart'] = time.time()
+                            f['upstate'] = rsemgr.upload(rse_settings=rse_settings,
+                                                         lfns=[{'filename': f['filename'],
+                                                                'name': f['name'],
+                                                                'scope': f['scope'],
+                                                                'adler32': f['adler32'],
+                                                                'filesize': f['bytes']}],
+                                                         source_dir=directory,
+                                                         force_pfn=args.pfn,
+                                                         force_scheme=protocol['scheme'])
+                            trace['transferEnd'] = time.time()
+                            trace['clientState'] = 'DONE'
+                            success = True
+                            send_trace(trace, client.host, args.user_agent)
+                            summary.append(deepcopy(f))
+                            f.pop('upstate', None)
+                        except Exception as error:
+                            logger.warning(str(error))
+                            trace['clientState'] = str(type(error).__name__)
+                    if success:
+                        duration = round(trace['transferEnd'] - trace['transferStart'], 2)
+                        logger.info('File %s:%s successfully uploaded. %s in %s seconds = %s MBps' % (f['scope'],
+                                                                                                      f['name'],
+                                                                                                      sizefmt(f['bytes'], args.human),
+                                                                                                      duration,
+                                                                                                      round((f['bytes'] / duration) * 1e-6, 2)))
+                    else:
+                        logger.error('Cannot upload file %s:%s' % (f['scope'], f['name']))
                 else:
                     raise DataIdentifierAlreadyExists
         except NotImplementedError as error:
@@ -1077,26 +1094,46 @@ def upload(args):
                             client.add_replication_rule([make_valid_did(f)], copies=1, rse_expression=args.rse, lifetime=args.lifetime)
                         except RucioException:
                             logger.error("A Rucio exception occurred when adding a replication rule for %s:%s" % (f['scope'], f['name']))
-                directory = revert_dict[f['scope'], f['name']]
-                trace['remoteSite'] = rse_settings['rse']
-                trace['protocol'] = rse_settings['protocols'][0]['scheme']
-                trace['filesize'] = f['bytes']
-                trace['transferStart'] = time.time()
-                logger.debug("Uploading source file to RSE")
-                f['upstate'] = rsemgr.upload(rse_settings=rse_settings,
-                                             lfns=[{'filename': f['filename'],
-                                                    'name': f['name'],
-                                                    'scope': f['scope'],
-                                                    'adler32': f['adler32'],
-                                                    'filesize': f['bytes']}],
-                                             source_dir=directory,
-                                             force_pfn=args.pfn)
-                trace['transferEnd'] = time.time()
-                trace['clientState'] = 'DONE'
-                logger.info('File {0}:{1} successfully uploaded on the storage'.format(f['scope'], f['name']))
-                send_trace(trace, client.host, args.user_agent)
-                summary.append(deepcopy(f))
-                f.pop('upstate', None)
+                success = False
+                protocols = rsemgr.get_protocols_ordered(rse_settings, operation='write', scheme=forced_protocol)
+                logger.debug('%d possible protocol(s) for write' % len(protocols))
+                while not success and len(protocols):
+                    protocol = protocols.pop(0)
+                    logger.debug('Trying protocol %s at %s' % (protocol['scheme'], rse_settings['rse']))
+                    directory = revert_dict[f['scope'], f['name']]
+                    trace['remoteSite'] = rse_settings['rse']
+                    trace['protocol'] = protocol['scheme']
+                    trace['filesize'] = f['bytes']
+                    try:
+                        trace['transferStart'] = time.time()
+                        logger.debug("Uploading source file to RSE")
+                        f['upstate'] = rsemgr.upload(rse_settings=rse_settings,
+                                                     lfns=[{'filename': f['filename'],
+                                                            'name': f['name'],
+                                                            'scope': f['scope'],
+                                                            'adler32': f['adler32'],
+                                                            'filesize': f['bytes']}],
+                                                     source_dir=directory,
+                                                     force_pfn=args.pfn,
+                                                     force_scheme=protocol['scheme'])
+                        trace['transferEnd'] = time.time()
+                        trace['clientState'] = 'DONE'
+                        success = True
+                        send_trace(trace, client.host, args.user_agent)
+                        summary.append(deepcopy(f))
+                        f.pop('upstate', None)
+                    except Exception as error:
+                        logger.warning(str(error))
+                        trace['clientState'] = str(type(error).__name__)
+                if success:
+                    duration = round(trace['transferEnd'] - trace['transferStart'], 2)
+                    logger.info('File %s:%s successfully uploaded. %s in %s seconds = %s MBps' % (f['scope'],
+                                                                                                  f['name'],
+                                                                                                  sizefmt(f['bytes'], args.human),
+                                                                                                  duration,
+                                                                                                  round((f['bytes'] / duration) * 1e-6, 2)))
+                else:
+                    logger.error('Cannot upload file %s:%s' % (f['scope'], f['name']))
             except (Duplicate, FileAlreadyExists) as error:
                 logger.warning(error)
                 return FAILURE
